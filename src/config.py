@@ -9,8 +9,18 @@ from dotenv import load_dotenv
 # Cargar variables de entorno
 load_dotenv()
 
+
+from pathlib import Path
+from dotenv import load_dotenv
+import os
+
+
+
+
 # Directorios
-BASE_DIR = Path(__file__).parent.parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent  # ✅ raíz del proyecto
+load_dotenv(dotenv_path=BASE_DIR / ".env")         # ✅ carga garantizada del .env
+
 SRC_DIR = BASE_DIR / "src"
 LOGS_DIR = BASE_DIR / "logs"
 
@@ -34,8 +44,8 @@ MOTION_CONFIG = {
 # Configuración de Telegram (habilitado por defecto para envío gratuito)
 TELEGRAM_CONFIG = {
     'enabled': os.getenv('TELEGRAM_ENABLED', 'True').lower() == 'true',
-    'bot_token': os.getenv('TELEGRAM_BOT_TOKEN', ''),
-    'chat_id': os.getenv('TELEGRAM_CHAT_ID', ''),
+    'bot_token': os.getenv('TELEGRAM_BOT_TOKEN', '').strip(),
+    'chat_id': os.getenv('TELEGRAM_CHAT_ID', '').strip(),
 }
 
 # Configuración de Twilio (deshabilitado por defecto para evitar costes SMS)
