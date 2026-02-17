@@ -1,0 +1,29 @@
+# Entornos virtuales
+.venv/
+venv/
+
+# Caché Python
+__pycache__/
+*.pyc
+
+# Logs
+logs/
+*.log
+
+# Variables de entorno (SECRETOS)
+.env
+.env.*
+!.env.example
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Archivos temporales / informes
+imports_report.txt
+python_env.txt
+vscode_extensions.txt
+
+# Sistema
+.DS_Store
+Thumbs.db
