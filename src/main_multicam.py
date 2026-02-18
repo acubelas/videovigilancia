@@ -307,9 +307,15 @@ class MultiCamApp:
 
         Path("logs").mkdir(exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
-        p = Path("logs") / f"alert_{self.names_active[cam_index]}_{ts}.jpg"
-        cv2.imwrite(str(p), frame)
-        self.telegram.send_alert_async(message, str(p))
+
+        # Nombre seguro para fichero (sin espacios raros)
+        cam_name = self.names_active[cam_index]
+        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in cam_name)
+
+        photo_path = Path("logs") / f"alert_{cam_index+1:02d}_{safe_name}_{ts}.jpg"
+        cv2.imwrite(str(photo_path), frame)
+
+        self.telegram.send_alert_async(message, str(photo_path))
 
     def run(self):
         start = time.time()
@@ -343,7 +349,15 @@ class MultiCamApp:
                         now = time.time()
                         if now - self.last_alert_ts[i] >= self.alert_cooldown:
                             self.last_alert_ts[i] = now
-                            msg = f"🚨 PERSONA DETECTADA en {self.names_active[i]}\n{time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+                            cam_name = self.names_active[i]
+                            cam_tag = f"CAM{i+1}"
+
+                            msg = (
+                                f"🚨 PERSONA DETECTADA en {cam_name} ({cam_tag})\n"
+                                f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                            )
+
                             self._send_alert(i, msg, annotated)
 
                 mosaic = build_mosaic(annotated_frames, self.labels, self.tile_w, self.tile_h, self.cols)
