@@ -1,47 +1,128 @@
 import logging
-from typing import Optional
+import os
+import threading
+from typing import List, Optional, Tuple
+
 import requests
 
+
 class TelegramAlert:
-    """Envía alertas por Telegram usando API HTTP (texto + foto)."""
+    """Envía alertas por Telegram usando Bot API HTTP a múltiples destinos.
 
-    def __init__(self, bot_token: str, chat_id: str):
+    - Usuarios (chat privado) y Grupos/Canales.
+    - Si hay IDs en ambas listas, se envía a TODOS.
+
+    Variables .env:
+      TELEGRAM_BOT_TOKEN=...
+      TELEGRAM_USER_CHAT_IDS=123,456
+      TELEGRAM_GROUP_CHAT_IDS=-100123,-100456
+
+    Compatibilidad:
+      TELEGRAM_CHAT_ID=...  (se añade a USER_CHAT_IDS)
+      TELEGRAM_CHAT_IDS=... (se añade a USER_CHAT_IDS)
+    """
+
+    def __init__(self, bot_token: str, user_chat_ids: List[str], group_chat_ids: List[str]):
         self.logger = logging.getLogger(__name__)
-        self.chat_id = chat_id
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
-        self.logger.info("TelegramAlert (HTTP) inicializado")
 
-    def send_alert(self, message: str, photo_path: Optional[str] = None) -> bool:
+        self.user_chat_ids = [str(c).strip() for c in user_chat_ids if str(c).strip()]
+        self.group_chat_ids = [str(c).strip() for c in group_chat_ids if str(c).strip()]
+        self.destinations = self._unique(self.user_chat_ids + self.group_chat_ids)
+
+        self.logger.info("TelegramAlert inicializado: %d destinos", len(self.destinations))
+
+    @staticmethod
+    def _unique(items: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for x in items:
+            if x not in seen:
+                out.append(x)
+                seen.add(x)
+        return out
+
+    @staticmethod
+    def parse_ids(raw: str) -> List[str]:
+        if not raw:
+            return []
+        parts = [p.strip() for p in raw.split(",")]
+        return [p for p in parts if p]
+
+    @classmethod
+    def from_env(cls) -> Optional["TelegramAlert"]:
+        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        if not token:
+            return None
+
+        user_ids = cls.parse_ids(os.getenv("TELEGRAM_USER_CHAT_IDS", "").strip())
+        group_ids = cls.parse_ids(os.getenv("TELEGRAM_GROUP_CHAT_IDS", "").strip())
+
+        # Compatibilidad con claves antiguas
+        legacy_single = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        legacy_multi = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
+
+        if legacy_single and legacy_single not in user_ids and legacy_single not in group_ids:
+            user_ids.append(legacy_single)
+
+        for x in cls.parse_ids(legacy_multi):
+            if x not in user_ids and x not in group_ids:
+                user_ids.append(x)
+
+        if not (user_ids or group_ids):
+            return None
+
+        return cls(token, user_ids, group_ids)
+
+    def send_message(self, chat_id: str, text: str) -> bool:
         try:
-            if photo_path:
-                url = f"{self.base_url}/sendPhoto"
-                with open(photo_path, "rb") as f:
-                    r = requests.post(
-                        url,
-                        data={"chat_id": self.chat_id, "caption": message},
-                        files={"photo": f},
-                        timeout=20
-                    )
-            else:
-                url = f"{self.base_url}/sendMessage"
+            url = f"{self.base_url}/sendMessage"
+            r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
+            if r.status_code == 200:
+                return True
+            self.logger.error("Telegram sendMessage %s: %s", r.status_code, r.text)
+            return False
+        except Exception as e:
+            self.logger.error("Telegram sendMessage error: %s", e)
+            return False
+
+    def send_photo(self, chat_id: str, caption: str, photo_path: str) -> bool:
+        try:
+            url = f"{self.base_url}/sendPhoto"
+            with open(photo_path, "rb") as f:
                 r = requests.post(
                     url,
-                    data={"chat_id": self.chat_id, "text": message},
-                    timeout=20
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"photo": f},
+                    timeout=20,
                 )
-
             if r.status_code == 200:
-                self.logger.info("Alerta Telegram enviada correctamente")
                 return True
-
-            self.logger.error(f"Telegram HTTP {r.status_code}: {r.text}")
+            self.logger.error("Telegram sendPhoto %s: %s", r.status_code, r.text)
             return False
-
         except Exception as e:
-            self.logger.error(f"Error enviando Telegram: {e}")
+            self.logger.error("Telegram sendPhoto error: %s", e)
             return False
+
+    def send_alert(self, message: str, photo_path: Optional[str] = None) -> Tuple[int, int]:
+        total = len(self.destinations)
+        ok = 0
+        for chat_id in self.destinations:
+            if photo_path:
+                ok += 1 if self.send_photo(chat_id, message, photo_path) else 0
+            else:
+                ok += 1 if self.send_message(chat_id, message) else 0
+        return ok, total
 
     def send_alert_async(self, message: str, photo_path: Optional[str] = None):
-        import threading
         t = threading.Thread(target=self.send_alert, args=(message, photo_path), daemon=True)
         t.start()
+
+    def get_updates(self, timeout: int = 5, limit: int = 100, offset: Optional[int] = None):
+        params = {"timeout": timeout, "limit": limit}
+        if offset is not None:
+            params["offset"] = offset
+        url = f"{self.base_url}/getUpdates"
+        r = requests.get(url, params=params, timeout=timeout + 5)
+        r.raise_for_status()
+        return r.json()
