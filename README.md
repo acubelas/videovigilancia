@@ -1,49 +1,41 @@
-# Videovigilancia (Python + OpenCV) — Mosaico multicámara + detección + alertas Telegram
+# Videovigilancia (UI Multicámara)
 
-Proyecto de videovigilancia en Python que permite:
-- Captura de vídeo desde **webcam local**, **Android MJPEG (IP Webcam)** y **RTSP (iPad/iPhone)**.
-- Visualización en **mosaico** (grid automático) con nombre por cámara.
-- **Detección de personas** (PersonDetector).
-- **Alertas por Telegram** (mensaje + foto) indicando **qué cámara detectó**.
-- Modo de baja latencia para streams (ej. Android MJPEG) mediante `--drop-frames`.
-
-> ⚠️ Privacidad/Legal: usa este proyecto de forma responsable, con consentimiento y respetando normativa local.
-
----
-
-## 📁 Estructura del proyecto
-
-- `src/main.py`  
-  Ejecución **single-cam** (una fuente: webcam o URL) mediante `--source`.
-- `src/main_multicam.py`  
-  Ejecución **multicámara** con **mosaico** y cámaras **configuradas** en `.env` vía `MULTICAM_CONFIG`.
-- `src/camera/camera_manager.py`  
-  Gestión de captura (índice o URL). Para URLs se recomienda usar FFmpeg cuando aplique.
-- `src/alerts/telegram_alert.py`  
-  Envío Telegram (mensaje + foto).
-- `src/config.py`  
-  Carga `.env` y define `CAMERA_CONFIG`, `TELEGRAM_CONFIG`, etc.
-- `tests/`  
-  Pruebas rápidas (p.ej. MJPEG/FFmpeg).
+**UI de videovigilancia en Python** con:
+- ✅ Multicámara (mosaico adaptable)  
+- ✅ Fuentes: **Webcam**, **Android (IP Webcam MJPEG)**, **iPad (RTSP)**  
+- ✅ **Scroll** y **Zoom** en la previsualización  
+- ✅ **Detección** (personas/vehículos) con YOLO (ultralytics)  
+- ✅ **Alertas Telegram** multi‑destinatario (usuarios + grupos), configurable desde la UI  
+- ✅ Guardado de configuración en `.env` y persistencia de cámaras  
+- ✅ Reconexión automática de cámaras (backoff) ante cortes
 
 ---
 
-## ✅ Requisitos
-
-- macOS (probado en Mac) con **Python 3.12+**
-- `pip`, `venv`
-- Dependencias Python (ver instalación más abajo)
-- Para cámaras móviles:
-  - Android: app tipo **IP Webcam** (MJPEG)
-  - iPad/iPhone: app tipo **OctoStream RTSP Server** (RTSP)
+## Índice
+- Requisitos
+- Instalación
+- Variables de entorno (.env)
+- Ejecución
+- Uso de la UI
+- [Cámaras soportadas](#cámaras-soportadas Telegram
+- Reconexión de cámaras
+- Solución de problemas
+- Estructura del proyecto
+- Contribuir
+- Licencia
 
 ---
 
-## 🚀 Instalación
+## Requisitos
 
-### 1) Crear y activar entorno virtual
-Desde la raíz del proyecto:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
+- **Python 3.10+** (probado en 3.12)
+- macOS/Windows/Linux
+- Paquetes en `requirements.txt` (ejemplo):
+  ```txt
+  opencv-python
+  pillow
+  python-dotenv
+  numpy
+  # Si usas ultralytics para YOLO:
+  ultralytics
+  requests

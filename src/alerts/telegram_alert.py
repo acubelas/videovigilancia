@@ -2,25 +2,13 @@ import logging
 import os
 import threading
 from typing import List, Optional, Tuple
+from datetime import datetime
 
 import requests
 
 
 class TelegramAlert:
-    """Envía alertas por Telegram usando Bot API HTTP a múltiples destinos.
-
-    - Usuarios (chat privado) y Grupos/Canales.
-    - Si hay IDs en ambas listas, se envía a TODOS.
-
-    Variables .env:
-      TELEGRAM_BOT_TOKEN=...
-      TELEGRAM_USER_CHAT_IDS=123,456
-      TELEGRAM_GROUP_CHAT_IDS=-100123,-100456
-
-    Compatibilidad:
-      TELEGRAM_CHAT_ID=...  (se añade a USER_CHAT_IDS)
-      TELEGRAM_CHAT_IDS=... (se añade a USER_CHAT_IDS)
-    """
+    """Envía alertas por Telegram usando Bot API HTTP a múltiples destinos."""
 
     def __init__(self, bot_token: str, user_chat_ids: List[str], group_chat_ids: List[str]):
         self.logger = logging.getLogger(__name__)
@@ -58,7 +46,6 @@ class TelegramAlert:
         user_ids = cls.parse_ids(os.getenv("TELEGRAM_USER_CHAT_IDS", "").strip())
         group_ids = cls.parse_ids(os.getenv("TELEGRAM_GROUP_CHAT_IDS", "").strip())
 
-        # Compatibilidad con claves antiguas
         legacy_single = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         legacy_multi = os.getenv("TELEGRAM_CHAT_IDS", "").strip()
 
@@ -74,10 +61,18 @@ class TelegramAlert:
 
         return cls(token, user_ids, group_ids)
 
+    # ------------------------------------------------------------------
+    # ENVÍO BÁSICO
+    # ------------------------------------------------------------------
+
     def send_message(self, chat_id: str, text: str) -> bool:
         try:
             url = f"{self.base_url}/sendMessage"
-            r = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=20)
+            r = requests.post(
+                url,
+                data={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                timeout=20,
+            )
             if r.status_code == 200:
                 return True
             self.logger.error("Telegram sendMessage %s: %s", r.status_code, r.text)
@@ -92,7 +87,11 @@ class TelegramAlert:
             with open(photo_path, "rb") as f:
                 r = requests.post(
                     url,
-                    data={"chat_id": chat_id, "caption": caption},
+                    data={
+                        "chat_id": chat_id,
+                        "caption": caption,
+                        "parse_mode": "Markdown",
+                    },
                     files={"photo": f},
                     timeout=20,
                 )
@@ -103,6 +102,54 @@ class TelegramAlert:
         except Exception as e:
             self.logger.error("Telegram sendPhoto error: %s", e)
             return False
+
+    # ------------------------------------------------------------------
+    # 🚨 ALERTA DE PERSONA (NUEVO)
+    # ------------------------------------------------------------------
+
+    def send_person_alert(
+        self,
+        camera_name: str,
+        photo_path: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ) -> Tuple[int, int]:
+        """
+        Envía una alerta indicando QUÉ CÁMARA detectó la persona y CUÁNDO.
+        """
+        if timestamp is None:
+            timestamp = datetime.now()
+
+        message = (
+            "🚨 *ALERTA DE PERSONA*\n"
+            f"📷 Cámara: *{camera_name}*\n"
+            f"🕒 {timestamp.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        total = len(self.destinations)
+        ok = 0
+
+        for chat_id in self.destinations:
+            if photo_path:
+                ok += 1 if self.send_photo(chat_id, message, photo_path) else 0
+            else:
+                ok += 1 if self.send_message(chat_id, message) else 0
+
+        return ok, total
+
+    def send_person_alert_async(
+        self,
+        camera_name: str,
+        photo_path: Optional[str] = None,
+        timestamp: Optional[datetime] = None,
+    ):
+        t = threading.Thread(
+            target=self.send_person_alert,
+            args=(camera_name, photo_path, timestamp),
+            daemon=True,
+        )
+        t.start()
+
+    # ------------------------------------------------------------------
 
     def send_alert(self, message: str, photo_path: Optional[str] = None) -> Tuple[int, int]:
         total = len(self.destinations)
