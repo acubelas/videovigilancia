@@ -27,3 +27,6 @@ vscode_extensions.txt
 # Sistema
 .DS_Store
 Thumbs.db
+# Server local data (no versionar)
+data/
+*.db
