@@ -1,24 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-Videovigilancia - UI Multicámara (VERSIÓN DEFINITIVA)
+Videovigilancia - UI Multicámara (VERSIÓN INTEGRADA / SIN ZOOM)
 
-✔ Multicámara real (mosaico)
+✔ Multicámara (mosaico)
 ✔ Webcam / Android MJPEG / iPad RTSP
-✔ Escaneo de webcams y red
+✔ Detección por Wi‑Fi (puertos 8080/8554) usando src/discovery/network_scan.py
+✔ UI: diálogo para listar, probar y añadir cámaras detectadas
 ✔ Telegram multi-destinatario configurable desde la UI
 ✔ Guardado en .env
 ✔ Baja latencia
 ✔ Personas + vehículos
 ✔ Día / Noche
-✔ Scroll en previsualización + Zoom
+✔ Scroll horizontal debajo de los botones + Scroll vertical en previsualización
 """
 
 import os
 import cv2
 import time
 import threading
-import ipaddress
-import socket
 import math
 from datetime import datetime
 
@@ -33,6 +32,16 @@ load_dotenv()
 from src.detection.person_detector import PersonDetector
 from src.alerts.telegram_alert import TelegramAlert
 from src.camera.discovery import discover_local_cameras
+
+# --- Import robusto del escaneo de red (tu fichero) ---
+ns_discover = None
+try:
+    from src.discovery.network_scan import discover_cameras as ns_discover
+except Exception:
+    try:
+        from src.discovery.Network_scan import discover_cameras as ns_discover
+    except Exception:
+        ns_discover = None
 
 # ============================================================
 # ENV
@@ -53,11 +62,13 @@ def update_env_key(key, value, env_path=".env"):
         with open(env_path, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
 
+    replaced = False
     for i, line in enumerate(lines):
         if line.startswith(f"{key}="):
             lines[i] = f"{key}={value}"
+            replaced = True
             break
-    else:
+    if not replaced:
         lines.append(f"{key}={value}")
 
     with open(env_path, "w", encoding="utf-8") as f:
@@ -158,6 +169,7 @@ class CamWorker(threading.Thread):
         self.status = "Parada"
         self.last_brightness = None
         self._last_detect = 0
+        self._last_frame_ts = time.time()
 
         self.detector = PersonDetector(
             model_path=YOLO_MODEL_PATH,
@@ -175,47 +187,105 @@ class CamWorker(threading.Thread):
         if isinstance(src, str) and src.isdigit():
             src = int(src)
 
-        if isinstance(src, str) and src.startswith("rtsp://"):
+        if isinstance(src, str) and (src.startswith("rtsp://") or src.startswith("http://") or src.startswith("https://")):
             self.cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-            # Reduce buffering/latencia
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             try:
-                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)
-                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)
+                self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 2500)
+                self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2500)
             except Exception:
                 pass
         else:
             self.cap = cv2.VideoCapture(src)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+            
     def run(self):
+        # Asegura que existe el timestamp de último frame (por si no lo pusiste en __init__)
+        if not hasattr(self, "_last_frame_ts"):
+            self._last_frame_ts = time.time()
+
+        # Abre captura inicial
         self._open()
+        self._last_frame_ts = time.time()
+
         while not self.stop_evt.is_set():
             frame = None
-            # Lee varios frames para vaciar buffer y reducir lag
-            for _ in range(5):
-                ok, tmp = self.cap.read()
-                if ok:
-                    frame = tmp
 
+            # 1) Leer SIEMPRE el frame más reciente (descartar antiguos)
+            try:
+                # grab() descarta frames sin decodificar (más rápido que read)
+                for _ in range(10):
+                    if self.stop_evt.is_set():
+                        break
+                    if not self.cap or not self.cap.grab():
+                        break
+
+                if self.stop_evt.is_set():
+                    break
+
+                if self.cap:
+                    ok, tmp = self.cap.retrieve()
+                    if ok:
+                        frame = tmp
+            except Exception:
+                frame = None
+
+            # 2) Si no hay frame -> marca sin señal y aplica watchdog de reconexión
             if frame is None:
                 self.status = "Sin señal"
-                time.sleep(0.2)
+
+                # Watchdog: si llevamos mucho sin frames, reabrir stream
+                if time.time() - self._last_frame_ts > 4.0:
+                    try:
+                        if self.cap:
+                            self.cap.release()
+                    except Exception:
+                        pass
+
+                    # Pequeña pausa antes de reabrir
+                    time.sleep(0.5)
+
+                    # Reintento de apertura
+                    try:
+                        self._open()
+                    except Exception:
+                        pass
+
+                    self._last_frame_ts = time.time()
+
+                # Evita bucle agresivo sin señal
+                time.sleep(0.10)
                 continue
 
+            # 3) Tenemos frame: actualizar timestamp y estado
+            self._last_frame_ts = time.time()
             self.status = "Activa"
+
             confirmed = False
             annotated = frame
 
+            # 4) Detección con throttle y LOCK NO BLOQUEANTE (evita lag entre cámaras)
             now = time.time()
-            if now - self._last_detect > 0.4:
+            if now - self._last_detect > 0.6:  # ajusta 0.6..1.2 según CPU/cámaras
                 self._last_detect = now
-                with DETECT_LOCK:
-                    confirmed, annotated = self.detector.detect(frame)
-                self.last_brightness = getattr(self.detector, "last_brightness", None)
 
+                acquired = DETECT_LOCK.acquire(blocking=False)
+                if acquired:
+                    try:
+                        confirmed, annotated = self.detector.detect(frame)
+                        self.last_brightness = getattr(self.detector, "last_brightness", None)
+                    finally:
+                        DETECT_LOCK.release()
+                else:
+                    # Si otra cámara está detectando, no bloqueamos captura
+                    confirmed, annotated = False, frame
+                    # last_brightness se mantiene con el último valor válido
+
+            # 5) Publicar frame para UI
             self.frame = annotated
 
+            # 6) Enviar alerta si confirmado
             if confirmed:
                 send_telegram_alert(
                     self.name,
@@ -223,18 +293,21 @@ class CamWorker(threading.Thread):
                     getattr(self.detector, "last_detected_type", "OBJETO"),
                 )
 
-        if self.cap:
-            self.cap.release()
+            # Pequeño sleep opcional para no ir a tope si todo va muy rápido
+            # (normalmente no hace falta, pero ayuda en streams que entregan frames muy rápido)
+            time.sleep(0.001)
 
+        # Cleanup al salir
+        try:
+            if self.cap:
+                self.cap.release()
+        except Exception:
+            pass
 
 # ============================================================
 # MOSAICO
 # ============================================================
 def build_mosaic(frames, cols=2, tile_w=640, tile_h=360):
-    """
-    Construye un mosaico (sin separaciones) a partir de frames BGR.
-    frames: lista de tuplas (name, status, frame, brightness)
-    """
     tiles = []
     for name, status, frame, brightness in frames:
         if frame is None:
@@ -246,39 +319,29 @@ def build_mosaic(frames, cols=2, tile_w=640, tile_h=360):
         else:
             img = cv2.resize(frame, (tile_w, tile_h))
 
-        # Etiqueta superior izquierda con el nombre
-        cv2.putText(
-            img, name, (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2
-        )
+        cv2.putText(img, name, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
-        # Indicador día/noche si hay brillo calculado
         if brightness is not None:
             icon = "🌙" if brightness < 45 else "☀️"
-            cv2.putText(
-                img, icon, (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2
-            )
+            cv2.putText(img, icon, (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
         tiles.append(img)
 
     if not tiles:
         return None
 
-    # 🔧 Rellenar la última fila con tiles negros hasta completar 'cols'
     rem = len(tiles) % cols
     if rem:
-        pad = cols - rem
-        for _ in range(pad):
+        for _ in range(cols - rem):
             tiles.append(np.zeros((tile_h, tile_w, 3), dtype=np.uint8))
 
     rows = []
     for i in range(0, len(tiles), cols):
-        row = np.hstack(tiles[i:i + cols])
-        rows.append(row)
+        rows.append(np.hstack(tiles[i:i + cols]))
 
-    mosaic = np.vstack(rows)
-    return mosaic
+    return np.vstack(rows)
 
 
 # ============================================================
@@ -292,11 +355,6 @@ class MultiCamUI(tk.Tk):
 
         self.cameras = {}
         self.workers = {}
-
-        # Zoom del mosaico en %
-        self.zoom_pct = tk.IntVar(value=100)
-
-        # ✅ Inicializa el flag ANTES de cualquier callback de zoom
         self._pending_refresh = False
 
         disabled = parse_disabled_names(DISABLED_RAW)
@@ -311,80 +369,87 @@ class MultiCamUI(tk.Tk):
         self._refresh_table()
         self.after(150, self._loop_preview)
 
-    # ---------------- UI ----------------
     def _build_ui(self):
-        # Toolbar superior
-        toolbar = ttk.Frame(self)
+        
+        top_area = ttk.Frame(self)
+        top_area.pack(fill=tk.BOTH, expand=False)
+
+        self.top_canvas = tk.Canvas(top_area, highlightthickness=0)
+        self.top_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        top_vscroll = ttk.Scrollbar(top_area, orient="vertical", command=self.top_canvas.yview)
+        top_vscroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.top_canvas.configure(yscrollcommand=top_vscroll.set)
+
+        # Frame real dentro del canvas (aquí meteremos toolbar + tabla)
+        self.top_content = ttk.Frame(self.top_canvas)
+        self.top_window_id = self.top_canvas.create_window((0, 0), window=self.top_content, anchor="nw")
+
+        # --- Toolbar superior (BOTONES) ---
+        toolbar = ttk.Frame(self.top_content)
         toolbar.pack(fill=tk.X, padx=8, pady=6)
 
-        ttk.Button(toolbar, text="Telegram", command=self.open_telegram_config).pack(
-            side=tk.LEFT, padx=4
-        )
-        # Botones de prueba de Telegram
-        ttk.Button(toolbar, text="Probar TG (texto)", command=self._on_test_telegram_text).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Button(toolbar, text="Probar TG (foto)", command=self._on_test_telegram_photo).pack(
-            side=tk.LEFT, padx=4
-        )
+        ttk.Button(toolbar, text="Telegram", command=self.open_telegram_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Probar TG (texto)", command=self._on_test_telegram_text).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Probar TG (foto)", command=self._on_test_telegram_photo).pack(side=tk.LEFT, padx=4)
 
-        # Zoom (crear label antes del scale para evitar callbacks prematuros sin label)
-        ttk.Label(toolbar, text="Zoom:").pack(side=tk.LEFT, padx=(16, 4))
-        self.zoom_label = ttk.Label(toolbar, text=f"{self.zoom_pct.get()}%")
-        self.zoom_label.pack(side=tk.LEFT, padx=(4, 12))
-        zoom_scale = ttk.Scale(
-            toolbar, from_=50, to=200,
-            orient="horizontal",
-            command=self._on_zoom_change
-        )
-        zoom_scale.set(self.zoom_pct.get())
-        zoom_scale.pack(side=tk.LEFT, padx=4)
-
-        ttk.Button(toolbar, text="Escanear webcams", command=self._scan_webcams).pack(
-            side=tk.LEFT, padx=4
-        )
-        ttk.Button(toolbar, text="Escanear red", command=self._scan_network).pack(
-            side=tk.LEFT, padx=4
-        )
+        ttk.Button(toolbar, text="Escanear webcams", command=self._scan_webcams).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Detectar cámaras (Wi‑Fi)", command=self._open_wifi_discovery_dialog).pack(side=tk.LEFT, padx=4)
 
         ttk.Button(toolbar, text="Añadir", command=self.add_cam).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="Eliminar", command=self.delete_cam).pack(
-            side=tk.LEFT, padx=4
-        )
-
-        ttk.Button(toolbar, text="Iniciar", command=self.start_all).pack(
-            side=tk.LEFT, padx=4
-        )
+        ttk.Button(toolbar, text="Eliminar", command=self.delete_cam).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="Iniciar", command=self.start_all).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Parar", command=self.stop_all).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Salir", command=self.destroy).pack(side=tk.LEFT, padx=4)
 
-        # Tabla de cámaras
-        mid = ttk.Frame(self)
-        mid.pack(fill=tk.X, padx=8)
+        # --- Scroll horizontal justo debajo de los botones (como pediste) ---
+        hscroll_bar = ttk.Frame(self.top_content)
+        hscroll_bar.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.h_scroll = ttk.Scrollbar(hscroll_bar, orient="horizontal")
+        self.h_scroll.pack(fill=tk.X)
+
+        # --- Tabla de cámaras ---
+        mid = ttk.Frame(self.top_content)
+        mid.pack(fill=tk.X, padx=8, pady=(0, 6))
         cols = ("enabled", "name", "src", "status")
         self.tree = ttk.Treeview(mid, columns=cols, show="headings", height=6)
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.pack(fill=tk.X)
 
-        # --- Zona de previsualización con scroll ---
+        # --- Mantener scrollregion del top_canvas y ajustar anchura del frame interior ---
+        def _top_on_configure(_event=None):
+            self.top_canvas.configure(scrollregion=self.top_canvas.bbox("all"))
+            # Asegura que el frame interior ocupe el ancho del canvas (para que los botones no se "corten")
+            self.top_canvas.itemconfigure(self.top_window_id, width=self.top_canvas.winfo_width())
+
+        self.top_content.bind("<Configure>", _top_on_configure)
+        self.top_canvas.bind("<Configure>", _top_on_configure)
+
+        # (Opcional) Scroll con rueda del ratón sobre la zona superior
+        def _top_wheel(event):
+            # En macOS event.delta suele ser pequeño; en Windows grande
+            delta = event.delta
+            step = -1 if delta > 0 else 1
+            self.top_canvas.yview_scroll(step, "units")
+
+        self.top_canvas.bind_all("<MouseWheel>", _top_wheel)
+
+        # Preview con scroll
         preview_frame = ttk.Frame(self)
         preview_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Canvas con barras de scroll
         self.preview_canvas = tk.Canvas(preview_frame, bg="black")
         self.preview_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         v_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_canvas.yview)
         v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        h_scroll = ttk.Scrollbar(self, orient="horizontal", command=self.preview_canvas.xview)
-        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.preview_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        self.preview_canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=self.h_scroll.set)
+        self.h_scroll.configure(command=self.preview_canvas.xview)
 
-        # Enlaza redimensionamiento para refrescar
         self.preview_canvas.bind("<Configure>", lambda e: self._request_refresh())
-        # Rueda del ratón (scroll vertical) y Shift+Rueda (horizontal)
         self._bind_mousewheel(self.preview_canvas)
 
     # ---------------- TELEGRAM UI ----------------
@@ -408,9 +473,7 @@ class MultiCamUI(tk.Tk):
             "• Grupos/Canales: el bot debe estar añadido\n\n"
             "Puedes importar chats automáticamente desde getUpdates."
         )
-        ttk.Label(win, text=info, justify="left", wraplength=780).pack(
-            padx=12, pady=10, anchor="w"
-        )
+        ttk.Label(win, text=info, justify="left", wraplength=780).pack(padx=12, pady=10, anchor="w")
 
         container = ttk.Frame(win)
         container.pack(fill="both", expand=True, padx=12, pady=8)
@@ -478,7 +541,6 @@ class MultiCamUI(tk.Tk):
 
             save_telegram_ids_to_env(users_new, groups_new)
 
-            # 🔥 Recargar env en memoria y re-crear cliente global de Telegram
             load_dotenv(".env", override=True)
             global TELEGRAM
             TELEGRAM = TelegramAlert.from_env()
@@ -486,7 +548,6 @@ class MultiCamUI(tk.Tk):
             messagebox.showinfo("Telegram", "Destinatarios guardados correctamente")
             win.destroy()
 
-        # Botonera acciones
         ttk.Button(actions, text="Añadir usuario", command=lambda: add_destination("user")).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Quitar usuario", command=lambda: remove_selected(lb_users)).pack(side=tk.LEFT, padx=4)
         ttk.Button(actions, text="Añadir grupo", command=lambda: add_destination("group")).pack(side=tk.LEFT, padx=12)
@@ -525,47 +586,185 @@ class MultiCamUI(tk.Tk):
         self._request_refresh()
         messagebox.showinfo("Webcams", f"Detectadas {len(cams)} webcam(s)")
 
-    def _scan_network(self):
-        ip = socket.gethostbyname(socket.gethostname())
-        net = ipaddress.ip_network(ip + "/24", strict=False)
+    # --- Diálogo Wi‑Fi ---
+    def _open_wifi_discovery_dialog(self):
+        if ns_discover is None:
+            messagebox.showwarning(
+                "Detección Wi‑Fi",
+                "No se encuentra src/discovery/network_scan.py o no expone discover_cameras()."
+            )
+            return
 
-        found = 0
-        for h in net.hosts():
-            host = str(h)
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.3)
-            try:
-                if s.connect_ex((host, 8080)) == 0:
-                    self.cameras[f"Android-{host}"] = {
-                        "src": f"http://{host}:8080/video",
-                        "enabled": True,
-                        "status": "Parada",
-                    }
-                    found += 1
-                elif s.connect_ex((host, 8554)) == 0:
-                    self.cameras[f"RTSP-{host}"] = {
-                        "src": f"rtsp://{host}:8554/stream",
-                        "enabled": True,
-                        "status": "Parada",
-                    }
-                    found += 1
-            finally:
-                s.close()
+        dlg = tk.Toplevel(self)
+        dlg.title("Detección de cámaras en Wi‑Fi")
+        dlg.geometry("980x520")
+        dlg.transient(self)
+        dlg.grab_set()
 
-        save_env_state(self.cameras)
-        self._refresh_table()
-        self._request_refresh()
-        messagebox.showinfo("Red", f"Detectadas {found} cámara(s) en red")
+        top = ttk.Frame(dlg)
+        top.pack(fill=tk.X, padx=10, pady=8)
+
+        ttk.Label(top, text="Subred (opcional, ej. 192.168.1.0/24):").pack(side=tk.LEFT, padx=(0, 6))
+        sub_var = tk.StringVar(value="")
+        ttk.Entry(top, textvariable=sub_var, width=22).pack(side=tk.LEFT, padx=(0, 10))
+
+        status_lbl = ttk.Label(top, text="Listo")
+        status_lbl.pack(side=tk.LEFT, padx=(12, 8))
+
+        def set_status(txt):
+            status_lbl.config(text=txt)
+            dlg.update_idletasks()
+
+        cols = ("ip", "puertos", "url")
+        tree = ttk.Treeview(dlg, columns=cols, show="headings", height=14)
+        tree.heading("ip", text="IP")
+        tree.heading("puertos", text="Puertos")
+        tree.heading("url", text="Candidata (doble clic para probar)")
+        tree.column("ip", width=140, anchor="center")
+        tree.column("puertos", width=180, anchor="center")
+        tree.column("url", width=600, anchor="w")
+        tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 6))
+
+        actions = ttk.Frame(dlg)
+        actions.pack(fill=tk.X, padx=10, pady=8)
+
+        scan_btn = ttk.Button(actions, text="Escanear")
+        test_btn = ttk.Button(actions, text="Probar URL seleccionada")
+        add_btn = ttk.Button(actions, text="Añadir a cámaras")
+        ttk.Button(actions, text="Cerrar", command=dlg.destroy).pack(side=tk.RIGHT, padx=4)
+
+        scan_btn.pack(side=tk.LEFT, padx=4)
+        test_btn.pack(side=tk.LEFT, padx=12)
+        add_btn.pack(side=tk.LEFT, padx=12)
+
+        results_cache = []
+
+        def do_scan():
+            scan_btn.config(state="disabled")
+            test_btn.config(state="disabled")
+            add_btn.config(state="disabled")
+            tree.delete(*tree.get_children())
+
+            hint = sub_var.get().strip() or None
+            set_status("Escaneando red… (puede tardar unos segundos)")
+
+            def worker():
+                nonlocal results_cache
+                try:
+                    results = ns_discover(auto_iface=True, cidr_hint=hint)
+                except TypeError:
+                    results = ns_discover(hint) if hint else ns_discover()
+                except Exception as e:
+                    self.after(0, lambda: messagebox.showerror("Detección Wi‑Fi", str(e)))
+                    results = []
+
+                def fill_table():
+                    tree.delete(*tree.get_children())
+                    results_cache = results or []
+
+                    # ✅ FILTRO: solo Android (8080) e iPad (8554)
+                    shown = 0
+                    for cam in results_cache:
+                        ip = cam.get("ip", "")
+                        ports = cam.get("ports", []) or []
+                        if 8080 not in ports and 8554 not in ports:
+                            continue
+                        puertos = ",".join(map(str, ports))
+                        for url in (cam.get("candidates") or [])[:3]:
+                            tree.insert("", tk.END, values=(ip, puertos, url))
+                            shown += 1
+
+                    set_status(f"Detectadas {shown} candidata(s) (Android 8080 / iPad 8554)")
+                    scan_btn.config(state="normal")
+                    test_btn.config(state="normal")
+                    add_btn.config(state="normal")
+
+                self.after(0, fill_table)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def get_selected_url():
+            sel = tree.selection()
+            if not sel:
+                return None, None
+            vals = tree.item(sel[0], "values")
+            if len(vals) < 3:
+                return None, None
+            return vals[0], vals[2]
+
+        def test_url(url):
+            # Probar 1 frame (sin congelar demasiado)
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG) if url.startswith("rtsp://") else cv2.VideoCapture(url)
+            if not cap.isOpened():
+                cap.release()
+                return False, "no-open"
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ok, _ = cap.read()
+            cap.release()
+            return (True, "ok") if ok else (False, "no-frame")
+
+        def do_test():
+            ip, url = get_selected_url()
+            if not url:
+                messagebox.showinfo("Probar", "Selecciona una fila con URL candidata.")
+                return
+            set_status(f"Probando {url} …")
+
+            def worker():
+                ok, st = test_url(url)
+
+                def done():
+                    set_status("Listo")
+                    if ok:
+                        messagebox.showinfo("Probar", f"✅ OK: {url}")
+                    else:
+                        messagebox.showwarning("Probar", f"❌ Fallo ({st}): {url}")
+
+                self.after(0, done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def do_add():
+            ip, url = get_selected_url()
+            if not url:
+                messagebox.showinfo("Añadir", "Selecciona una fila con URL candidata.")
+                return
+
+            base = "RTSP" if url.startswith("rtsp://") else "HTTP"
+            name_base = f"{base}-{ip}"
+            name = name_base
+            k = 1
+            while name in self.cameras:
+                k += 1
+                name = f"{name_base}-{k}"
+
+            self.cameras[name] = {"src": url, "enabled": True, "status": "Parada"}
+            save_env_state(self.cameras)
+            self._refresh_table()
+            self._request_refresh()
+            messagebox.showinfo("Añadir", f"Añadida cámara '{name}' con fuente:\n{url}")
+
+        scan_btn.configure(command=do_scan)
+        test_btn.configure(command=do_test)
+        add_btn.configure(command=do_add)
+
+        tree.bind("<Double-1>", lambda _e: do_test())
+
+        # ✅ Mejor: NO escanear automáticamente al abrir (evita esperas)
+        # do_scan()
 
     def start_all(self):
         for name, info in self.cameras.items():
-            if info["enabled"]:
-                w = CamWorker(name, info["src"])
-                self.workers[name] = w
-                w.start()
+            if not info.get("enabled", True):
+                continue
+            if name in self.workers:
+                continue
+            w = CamWorker(name, info["src"])
+            self.workers[name] = w
+            w.start()
 
     def stop_all(self):
-        for w in self.workers.values():
+        for w in list(self.workers.values()):
             w.stop_and_join()
         self.workers.clear()
 
@@ -574,36 +773,23 @@ class MultiCamUI(tk.Tk):
             self.tree.delete(i)
         for n, i in self.cameras.items():
             self.tree.insert("", tk.END, iid=n, values=(
-                "Sí" if i["enabled"] else "No",
+                "Sí" if i.get("enabled", True) else "No",
                 n,
-                i["src"],
-                i["status"],
+                i.get("src", ""),
+                i.get("status", ""),
             ))
 
     # ---------------- PREVISUALIZACIÓN + MOSAICO ----------------
-    def _on_zoom_change(self, _val):
-        # Actualiza etiqueta y refresca preview
-        try:
-            val = int(float(_val))
-        except Exception:
-            val = 100
-        self.zoom_pct.set(val)
-        if hasattr(self, "zoom_label"):
-            self.zoom_label.configure(text=f"{val}%")
-        self._request_refresh()
-
     def _bind_mousewheel(self, widget):
-        # Mac / Windows wheel
         def _on_wheel(event):
             delta = event.delta
-            if event.state & 0x0001:  # Shift para horizontal
+            if event.state & 0x0001:  # Shift horizontal
                 self.preview_canvas.xview_scroll(-1 if delta > 0 else 1, "units")
             else:
                 self.preview_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
-        widget.bind_all("<MouseWheel>", _on_wheel)       # Windows/macOS
-        widget.bind_all("<Shift-MouseWheel>", _on_wheel)
 
-        # Soporte básico para Linux (Button-4/5)
+        widget.bind_all("<MouseWheel>", _on_wheel)
+        widget.bind_all("<Shift-MouseWheel>", _on_wheel)
         widget.bind_all("<Button-4>", lambda e: self.preview_canvas.yview_scroll(-1, "units"))
         widget.bind_all("<Button-5>", lambda e: self.preview_canvas.yview_scroll(1, "units"))
 
@@ -614,23 +800,20 @@ class MultiCamUI(tk.Tk):
         if count <= 6: return 3
         if count <= 9: return 3
         if count <= 12: return 4
-        return 4  # puedes subir a 5 si sueles tener >12
+        return 4
 
     def _compute_tile_size(self, count: int, cols: int):
-        """Calcula el tamaño de los azulejos (16:9) en función del viewport y del zoom."""
+        """
+        SIN ZOOM: nunca hace upscale; solo reduce si hace falta para encajar.
+        """
         rows = max(1, math.ceil(count / max(1, cols)))
-        # Dimensiones del viewport actuales (si aún no están calculadas, usa defaults)
         vw = max(400, self.preview_canvas.winfo_width())
         vh = max(300, self.preview_canvas.winfo_height())
 
-        # Base (16:9) y zoom
         base_w = 640
         base_h = int(base_w * 9 / 16)
-        zoom = max(0.5, min(2.0, self.zoom_pct.get() / 100.0))
-        tw = int(base_w * zoom)
-        th = int(base_h * zoom)
+        tw, th = base_w, base_h
 
-        # Ajusta para intentar encajar en viewport sin ampliar
         total_w = cols * tw
         total_h = rows * th
         scale_w = vw / total_w if total_w > 0 else 1.0
@@ -642,56 +825,45 @@ class MultiCamUI(tk.Tk):
         return tw, th, rows
 
     def _request_refresh(self):
-        """Agrupa varias solicitudes de refresco para evitar repintados excesivos."""
-        # ✅ Blindaje: si aún no existe, inicializa el flag
-        if not hasattr(self, "_pending_refresh"):
-            self._pending_refresh = False
         if self._pending_refresh:
             return
         self._pending_refresh = True
-        self.after(60, self._loop_preview)  # refresco pronto
+        self.after(60, self._loop_preview)
 
     def _loop_preview(self):
         self._pending_refresh = False
 
         frames = []
-        for name, info in self.cameras.items():
+        for name in self.cameras:
             if name in self.workers:
                 w = self.workers[name]
                 frames.append((name, w.status, w.frame, w.last_brightness))
 
-        count = len(frames)
-        if count == 0:
-            # Limpia lienzo si no hay frames
+        if not frames:
             self.preview_canvas.delete("all")
             self.preview_canvas.configure(scrollregion=(0, 0, 0, 0))
-            # Mantener ciclo vivo
             self.after(150, self._loop_preview)
             return
 
+        count = len(frames)
         cols = self._choose_cols(count)
-        tile_w, tile_h, rows = self._compute_tile_size(count, cols)
+        tile_w, tile_h, _rows = self._compute_tile_size(count, cols)
 
         mosaic = build_mosaic(frames, cols=cols, tile_w=tile_w, tile_h=tile_h)
         if mosaic is None:
             self.after(150, self._loop_preview)
             return
 
-        # Convertir a imagen Tk
         rgb = cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB)
         imgtk = ImageTk.PhotoImage(Image.fromarray(rgb))
 
-        # Limpiar y dibujar en (0,0) anclado arriba-izquierda
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(0, 0, anchor="nw", image=imgtk)
-        # Guardar referencia para evitar GC
         self.preview_canvas.image = imgtk
 
-        # Configurar región de scroll según tamaño del mosaico
         h, w = mosaic.shape[:2]
         self.preview_canvas.configure(scrollregion=(0, 0, w, h))
 
-        # Mantener el refresco continuo
         self.after(150, self._loop_preview)
 
     # ---------------- PRUEBAS TELEGRAM (UI) ----------------
@@ -722,7 +894,6 @@ class MultiCamUI(tk.Tk):
         messagebox.showinfo("Telegram", "Foto de prueba enviada (revisa los destinos configurados).")
 
 
-# ============================================================
 def main():
     app = MultiCamUI()
     app.mainloop()
