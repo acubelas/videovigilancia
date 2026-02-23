@@ -27,3 +27,7 @@ vscode_extensions.txt
 # Sistema
 .DS_Store
 Thumbs.db
+# Artefactos locales
+estructura.txt
+src/ui/*backup*.py
+*backup*.py
