@@ -33,6 +33,11 @@ from src.detection.person_detector import PersonDetector
 from src.alerts.telegram_alert import TelegramAlert
 from src.camera.discovery import discover_local_cameras
 
+import json
+import subprocess
+import requests
+import qrcode
+
 # --- Import robusto del escaneo de red (tu fichero) ---
 ns_discover = None
 try:
@@ -390,6 +395,7 @@ class MultiCamUI(tk.Tk):
         toolbar = ttk.Frame(self.top_content)
         toolbar.pack(fill=tk.X, padx=8, pady=6)
 
+        ttk.Button(toolbar, text="Emparejar móvil (QR)", command=self._open_pairing_qr).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Telegram", command=self.open_telegram_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Probar TG (texto)", command=self._on_test_telegram_text).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="Probar TG (foto)", command=self._on_test_telegram_photo).pack(side=tk.LEFT, padx=4)
@@ -585,6 +591,120 @@ class MultiCamUI(tk.Tk):
         self._refresh_table()
         self._request_refresh()
         messagebox.showinfo("Webcams", f"Detectadas {len(cams)} webcam(s)")
+
+    def _get_tailscale_ip(self):
+        """
+        Devuelve la IP de Tailscale (100.x) para construir server_url.
+        Requiere que el comando 'tailscale' exista en PATH. [1](https://www.digitalsamba.com/blog/webrtc-security)
+        """
+        try:
+            out = subprocess.check_output(["tailscale", "ip", "-4"], text=True).strip()
+            # Puede devolver varias líneas; usamos la primera no vacía
+            for line in out.splitlines():
+                line = line.strip()
+                if line:
+                    return line
+        except Exception:
+            return None
+        return None
+
+
+    def _open_pairing_qr(self):
+        """
+        1) Llama al servidor: POST /api/pair/request -> pair_code (6 dígitos) + expires_at
+        2) Genera un QR con payload JSON: server_url + pair_code + expires_at
+        3) Muestra ventana con QR + botón copiar + regenerar
+        """
+        # --- Determinar server_url (solo Tailnet) ---
+        ts_ip = self._get_tailscale_ip()
+        if not ts_ip:
+            messagebox.showerror(
+                "Pairing QR",
+                "No se pudo obtener la IP de Tailscale.\n"
+                "Comprueba que Tailscale está conectado y que el comando 'tailscale ip -4' funciona."
+            )
+            return
+
+        server_url = f"http://{ts_ip}:8443"  # MVP (luego pasaremos a https)
+        endpoint = f"{server_url}/api/pair/request"
+
+        # --- Pedir pair_code al servidor ---
+        try:
+            r = requests.post(endpoint, timeout=5)
+            r.raise_for_status()
+            data = r.json()
+            pair_code = str(data.get("pair_code", "")).strip()
+            expires_at = int(data.get("expires_at", 0))
+            if not pair_code or len(pair_code) != 6:
+                raise ValueError("Respuesta inválida: pair_code no es de 6 dígitos")
+        except Exception as e:
+            messagebox.showerror("Pairing QR", f"No se pudo generar el código de emparejado:\n{e}")
+            return
+
+        payload = {
+            "server_url": server_url,
+            "pair_code": pair_code,
+            "expires_at": expires_at,
+            "api_version": "0.1.0",
+        }
+
+        payload_str = json.dumps(payload, ensure_ascii=False)
+
+        # --- Generar QR ---
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=8,
+            border=2,
+        )
+        qr.add_data(payload_str)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+
+        # --- UI: Ventana QR ---
+        win = tk.Toplevel(self)
+        win.title("Emparejar móvil (QR)")
+        win.geometry("420x520")
+        win.transient(self)
+        win.grab_set()
+
+        ttk.Label(win, text="Escanea este QR con la App móvil", font=("Arial", 13, "bold")).pack(pady=(12, 6))
+
+        # Convertir a ImageTk
+        imgtk = ImageTk.PhotoImage(img)
+        lbl_img = ttk.Label(win, image=imgtk)
+        lbl_img.image = imgtk
+        lbl_img.pack(pady=8)
+
+        # Texto informativo
+        info = ttk.Label(
+            win,
+            text=f"Servidor: {server_url}\nCódigo: {pair_code}\nCaduca en ~5 min",
+            justify="center"
+        )
+        info.pack(pady=(6, 8))
+
+    # Copiar payload al portapapeles (por si quieres pegarlo en pruebas)
+    def copy_payload():
+        self.clipboard_clear()
+        self.clipboard_append(payload_str)
+        messagebox.showinfo("Pairing QR", "Payload copiado al portapapeles")
+
+    # Regenerar QR
+    def regenerate():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self.after(50, self._open_pairing_qr)
+
+            actions = ttk.Frame(win)
+            actions.pack(fill=tk.X, pady=10, padx=10)
+
+            ttk.Button(actions, text="Copiar payload", command=copy_payload).pack(side=tk.LEFT, padx=4)
+            ttk.Button(actions, text="Regenerar", command=regenerate).pack(side=tk.LEFT, padx=4)
+            ttk.Button(actions, text="Cerrar", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+
 
     # --- Diálogo Wi‑Fi ---
     def _open_wifi_discovery_dialog(self):
