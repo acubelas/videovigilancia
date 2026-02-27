@@ -1,26 +1,38 @@
 import json
 import requests
 import qrcode
+from pathlib import Path
 
-API_BASE = "http://127.0.0.1:8080"        # el servidor visto desde el Mac
-PUBLIC_URL = "http://100.88.172.7:8080"   # el servidor visto desde el iPhone por Tailscale
+API_BASE = "http://127.0.0.1:8080"
+PUBLIC_URL = "http://100.88.172.7:8080"
 
 def main():
-    # 1) pedir pairingCode
-    resp = requests.post(f"{API_BASE}/pairing/code", timeout=10)
+    resp = requests.post(
+        f"{API_BASE}/pairing/request",
+        json={"method": "qr", "serverUrl": PUBLIC_URL},
+        timeout=10
+    )
     resp.raise_for_status()
-    code = resp.json()["pairingCode"]
+    data = resp.json()
 
-    # 2) JSON que irá dentro del QR
-    payload = {"serverUrl": PUBLIC_URL, "pairingCode": code}
-    text = json.dumps(payload)
+    pairing_id = data["pairingId"]
+    otp = data["otp"]
 
-    # 3) generar QR como PNG
-    img = qrcode.make(text)
-    img.save("pairing_qr.png")
+    payload = {"serverUrl": PUBLIC_URL, "pairingId": pairing_id}
+    qr_text = json.dumps(payload)
 
-    print("✅ QR generado: pairing_qr.png")
-    print("Contenido QR:", text)
+    out_png = Path("/tmp/pairing_qr.png")
+    out_json = Path("/tmp/pairing_payload.json")
+
+    img = qrcode.make(qr_text)
+    img.save(out_png)
+    out_json.write_text(qr_text, encoding="utf-8")
+
+    print("✅ QR:", out_png)
+    print("✅ JSON:", out_json)
+    print("pairingId:", pairing_id)
+    print("OTP:", otp)
+    print("Contenido QR:", qr_text)
 
 if __name__ == "__main__":
     main()
