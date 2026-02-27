@@ -1,14 +1,23 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import secrets
 import time
+import os
 from dataclasses import dataclass
+from dotenv import load_dotenv
+load_dotenv(".env")
 
 app = FastAPI(title="Videovigilancia")
 
-PAIRING_TTL = 600  # 10 min
-MAX_ATTEMPTS = 5
+# --- Config desde entorno (.env) ---
+PAIRING_TTL = int(os.getenv("PAIRING_TTL_SECONDS", "600"))  # 10 min
+MAX_ATTEMPTS = int(os.getenv("PAIRING_MAX_ATTEMPTS", "5"))
 
+BOT_SHARED_SECRET = os.getenv("BOT_SHARED_SECRET", "")
+TAILSCALE_SERVER_URL = os.getenv("TAILSCALE_SERVER_URL", "http://100.88.172.7:8080")
+TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "acubelasbot")
+
+# --- Modelo de sesión de emparejamiento ---
 @dataclass
 class PairingSession:
     pairing_id: str
@@ -17,25 +26,20 @@ class PairingSession:
     used: bool = False
     attempts: int = 0
 
-# En memoria (por ahora). OJO: si reinicias uvicorn, se pierde.
+# En memoria (por ahora). Si reinicias uvicorn, se pierde.
 pairings: dict[str, PairingSession] = {}
 
-
-# ---------- MODELOS ----------
+# --- Modelos API ---
 class PairingRequestIn(BaseModel):
-    method: str = "qr"  # por ahora solo "qr", luego añadimos "email"/"telegram"
-    # serverUrl se usa solo para construir qrPayload en respuesta (dev)
-    serverUrl: str | None = None
-
+    method: str = "qr"           # "qr" | "telegram"
+    serverUrl: str | None = None # para construir el payload QR
 
 class PairingRequestOut(BaseModel):
     pairingId: str
     ttlSeconds: int
-    # Para desarrollo: devolvemos el OTP para que el servidor lo muestre.
-    # En producción esto se devolvería solo a un panel admin o no se devolvería.
-    otp: str
-    qrPayload: dict
-
+    otp: str | None = None
+    qrPayload: dict | None = None
+    telegramStartUrl: str | None = None
 
 class PairingConfirmIn(BaseModel):
     pairingId: str
@@ -43,20 +47,26 @@ class PairingConfirmIn(BaseModel):
     deviceId: str | None = None
     deviceName: str | None = None
 
-
 class PairingConfirmOut(BaseModel):
     accessToken: str
 
-
-# ---------- ENDPOINTS ----------
+# --- Endpoints ---
 @app.get("/health")
 def health():
     return {"ok": True, "app": "Videovigilancia"}
 
+@app.get("/")
+def index():
+    return {
+        "ok": True,
+        "message": "Videovigilancia API",
+        "endpoints": ["/health", "/pairing/request", "/pairing/confirm", "/pairing/otp/{pairingId}"],
+    }
 
 @app.post("/pairing/request", response_model=PairingRequestOut)
 def pairing_request(req: PairingRequestIn):
-    # pairingId corto y otp 6 dígitos
+    method = (req.method or "qr").strip().lower()
+
     pairing_id = "P_" + secrets.token_urlsafe(6)
     otp = f"{secrets.randbelow(1_000_000):06d}"
 
@@ -68,16 +78,25 @@ def pairing_request(req: PairingRequestIn):
         attempts=0,
     )
 
-    server_url = (req.serverUrl or "").strip()
-    qr_payload = {"serverUrl": server_url, "pairingId": pairing_id}
+    public_url = (req.serverUrl or TAILSCALE_SERVER_URL).strip()
+    ttl = PAIRING_TTL
 
+    if method == "telegram":
+        start_payload = f"PAIR_{pairing_id}"
+        start_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={start_payload}"
+        return {
+            "pairingId": pairing_id,
+            "ttlSeconds": ttl,
+            "telegramStartUrl": start_url,
+        }
+
+    qr_payload = {"serverUrl": public_url, "pairingId": pairing_id}
     return {
         "pairingId": pairing_id,
-        "ttlSeconds": PAIRING_TTL,
+        "ttlSeconds": ttl,
         "otp": otp,
         "qrPayload": qr_payload,
     }
-
 
 @app.post("/pairing/confirm", response_model=PairingConfirmOut)
 def pairing_confirm(req: PairingConfirmIn):
@@ -88,11 +107,9 @@ def pairing_confirm(req: PairingConfirmIn):
     if not sess:
         raise HTTPException(status_code=400, detail="Invalid pairingId")
 
-    # TTL
     if (time.time() - sess.created_at) > PAIRING_TTL:
         raise HTTPException(status_code=400, detail="Expired code")
 
-    # one-time
     if sess.used:
         raise HTTPException(status_code=400, detail="Code already used")
 
@@ -104,17 +121,28 @@ def pairing_confirm(req: PairingConfirmIn):
         raise HTTPException(status_code=400, detail="Invalid code")
 
     sess.used = True
-
-    # Token simple para dev (luego JWT si quieres)
     token = secrets.token_urlsafe(24)
     return {"accessToken": token}
 
+# Endpoint PRIVADO para el bot: obtener OTP de un pairingId
+@app.get("/pairing/otp/{pairing_id}")
+def pairing_get_otp(pairing_id: str, x_bot_secret: str | None = Header(default=None)):
+    if not BOT_SHARED_SECRET:
+        raise HTTPException(status_code=500, detail="BOT_SHARED_SECRET not configured")
 
-# (Opcional) Raíz para que no haya 404 si abres en Safari
-@app.get("/")
-def index():
-    return {
-        "ok": True,
-        "message": "Videovigilancia API",
-        "endpoints": ["/health", "/pairing/request", "/pairing/confirm"],
-    }
+    if x_bot_secret != BOT_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized bot")
+
+    sess = pairings.get(pairing_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="pairingId not found")
+
+    if sess.used:
+        raise HTTPException(status_code=400, detail="Code already used")
+
+    age = time.time() - sess.created_at
+    if age > PAIRING_TTL:
+        raise HTTPException(status_code=400, detail="Expired code")
+
+    remaining = int(PAIRING_TTL - age)
+    return {"pairingId": pairing_id, "otp": sess.code, "ttlRemaining": remaining}
