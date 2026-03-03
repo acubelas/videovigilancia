@@ -10,6 +10,8 @@ import requests
 from server_api.db import init_db, get_chat_id_by_phone
 from server_api.telegram_utils import telegram_send_message
 
+from server_api.db import init_db, list_events, insert_event
+
 app = FastAPI(title="Videovigilancia")
 #inicializa SQLite
 init_db()
@@ -55,6 +57,24 @@ class PairingConfirmIn(BaseModel):
 
 class PairingConfirmOut(BaseModel):
     accessToken: str
+
+class EventIn(BaseModel):
+    ts: str
+    type: str
+    cameraId: str | None = None
+    confidence: float | None = None
+    message: str | None = None
+    snapshotPath: str | None = None
+
+class EventOut(BaseModel):
+    id: str
+    ts: str
+    type: str
+    cameraId: str | None = None
+    confidence: float | None = None
+    message: str | None = None
+    snapshotPath: str | None = None
+
 
 # --- Endpoints ---
 @app.get("/health")
@@ -189,3 +209,21 @@ def pairing_get_otp(pairing_id: str, x_bot_secret: str | None = Header(default=N
 
     remaining = int(PAIRING_TTL - age)
     return {"pairingId": pairing_id, "otp": sess.code, "ttlRemaining": remaining}
+
+@app.get("/events")
+def get_events(limit: int = 50):
+    limit = max(1, min(limit, 200))
+    return {"items": list_events(limit=limit)}
+
+@app.post("/events")
+def post_event(ev: EventIn):
+    # Para pruebas (luego lo blindamos con auth)
+    event_id = insert_event(
+        ts=ev.ts,
+        type_=ev.type,
+        camera_id=ev.cameraId,
+        confidence=ev.confidence,
+        message=ev.message,
+        snapshot_path=ev.snapshotPath,
+    )
+    return {"ok": True, "id": event_id}
