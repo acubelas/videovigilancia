@@ -6,8 +6,13 @@ import os
 from dataclasses import dataclass
 from dotenv import load_dotenv
 load_dotenv(".env")
+import requests
+from server_api.db import init_db, get_chat_id_by_phone
+from server_api.telegram_utils import telegram_send_message
 
 app = FastAPI(title="Videovigilancia")
+#inicializa SQLite
+init_db()
 
 # --- Config desde entorno (.env) ---
 PAIRING_TTL = int(os.getenv("PAIRING_TTL_SECONDS", "600"))  # 10 min
@@ -31,8 +36,9 @@ pairings: dict[str, PairingSession] = {}
 
 # --- Modelos API ---
 class PairingRequestIn(BaseModel):
-    method: str = "qr"           # "qr" | "telegram"
-    serverUrl: str | None = None # para construir el payload QR
+    method: str = "qr"            # "qr" | "telegram" | "telegram_phone"
+    serverUrl: str | None = None
+    phone: str | None = None      # usado en telegram_phone
 
 class PairingRequestOut(BaseModel):
     pairingId: str
@@ -67,6 +73,9 @@ def index():
 def pairing_request(req: PairingRequestIn):
     method = (req.method or "qr").strip().lower()
 
+    # ✅ DEFINIR ttl SIEMPRE ANTES DE USARLO
+    ttl = PAIRING_TTL
+
     pairing_id = "P_" + secrets.token_urlsafe(6)
     otp = f"{secrets.randbelow(1_000_000):06d}"
 
@@ -79,8 +88,8 @@ def pairing_request(req: PairingRequestIn):
     )
 
     public_url = (req.serverUrl or TAILSCALE_SERVER_URL).strip()
-    ttl = PAIRING_TTL
 
+    # --- TELEGRAM (bot + start) ---
     if method == "telegram":
         start_payload = f"PAIR_{pairing_id}"
         start_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={start_payload}"
@@ -90,6 +99,40 @@ def pairing_request(req: PairingRequestIn):
             "telegramStartUrl": start_url,
         }
 
+    # --- TELEGRAM POR NÚMERO (Sprint 1.3) ---
+    if method == "telegram_phone":
+        phone = (req.phone or "").strip().replace(" ", "")
+        if not phone:
+            raise HTTPException(status_code=400, detail="phone is required")
+        if not phone.startswith("+"):
+            raise HTTPException(status_code=400, detail="phone must be E.164 format (e.g. +346XXXXXXXX)")
+
+        chat_id = get_chat_id_by_phone(phone)
+
+        # No vinculado -> devolvemos link LINK_<pairingId>
+        if chat_id is None:
+            start_payload = f"LINK_{pairing_id}"
+            start_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={start_payload}"
+            return {
+                "pairingId": pairing_id,
+                "ttlSeconds": ttl,
+                "telegramStartUrl": start_url,
+            }
+
+        # Vinculado -> enviamos OTP directo por Telegram (Bot API sendMessage) 
+        telegram_send_message(
+            chat_id,
+            f"✅ Tu OTP es: {otp}\n"
+            f"⏳ Caduca en {ttl} segundos.\n\n"
+            "Vuelve a Videovigilancia Mobile y confirma."
+        )
+        return {
+            "pairingId": pairing_id,
+            "ttlSeconds": ttl,
+            "telegramStartUrl": None,
+        }
+
+    # --- QR (por defecto) ---
     qr_payload = {"serverUrl": public_url, "pairingId": pairing_id}
     return {
         "pairingId": pairing_id,

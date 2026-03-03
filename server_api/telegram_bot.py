@@ -3,8 +3,21 @@ import logging
 import requests
 from dotenv import load_dotenv
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import (
+    Update,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from server_api.db import init_db, upsert_link
 
 # ------------------------------------------------------------
 # CARGA DE CONFIG
@@ -15,6 +28,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 BOT_SECRET = os.getenv("BOT_SHARED_SECRET", "")
 API_BASE = os.getenv("API_BASE", "http://127.0.0.1:8080")
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "acubelasbot")
+
+# Para normalizar teléfonos sin '+', por defecto España (+34)
+DEFAULT_COUNTRY_CALLING_CODE = os.getenv("DEFAULT_COUNTRY_CALLING_CODE", "34")
 
 # Nivel de log configurable: DEBUG / INFO / WARNING / ERROR
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -29,29 +45,89 @@ logging.basicConfig(
 logger = logging.getLogger("telegram_bot")
 
 # ------------------------------------------------------------
+# DB INIT
+# ------------------------------------------------------------
+init_db()
+
+# ------------------------------------------------------------
 # HELPERS
 # ------------------------------------------------------------
 HELP_TEXT = (
     "👋 Hola, soy el bot de Videovigilancia.\n\n"
-    "Para emparejar, abre el enlace desde la app y pulsa START.\n"
-    f"Ejemplo:\nhttps://t.me/{BOT_USERNAME}?start=PAIR_<pairingId>\n"
+    "✅ Emparejar por Telegram (recibir OTP):\n"
+    f"   https://t.me/{BOT_USERNAME}?start=PAIR_<pairingId>\n\n"
+    "✅ Vincular tu teléfono (para que el servidor pueda enviarte OTP por número):\n"
+    f"   https://t.me/{BOT_USERNAME}?start=LINK_<pairingId>\n\n"
+    "Comandos:\n"
+    "  /ping  -> comprobar bot\n"
 )
 
-def extract_pairing_id(start_arg: str) -> str | None:
-    """
-    Espera un payload tipo: PAIR_P_xxx
-    Devuelve pairingId: P_xxx
-    """
-    start_arg = (start_arg or "").strip()
-    if start_arg.startswith("PAIR_"):
-        return start_arg.replace("PAIR_", "", 1)
-    return None
-
-def safe_preview(text: str, max_len: int = 180) -> str:
+def safe_preview(text: str, max_len: int = 400) -> str:
     if text is None:
         return ""
     text = str(text)
     return text if len(text) <= max_len else text[:max_len] + "…"
+
+def parse_start_payload(arg: str) -> tuple[str | None, str | None]:
+    """
+    PAIR_<pairingId> => ("PAIR", "<pairingId>")
+    LINK_<pairingId> => ("LINK", "<pairingId>")
+    """
+    s = (arg or "").strip()
+    if s.startswith("PAIR_"):
+        return "PAIR", s.replace("PAIR_", "", 1)
+    if s.startswith("LINK_"):
+        return "LINK", s.replace("LINK_", "", 1)
+    return None, None
+
+def normalize_phone_e164(raw_phone: str) -> str:
+    """
+    Normaliza a E.164 (básico):
+    - Si viene con '+' => se respeta
+    - Si viene '34XXXXXXXXX' => '+34XXXXXXXXX'
+    - Si viene 9 dígitos => '+34' + número (por defecto España)
+    - fallback: '+' + raw
+    """
+    raw = (raw_phone or "").strip().replace(" ", "")
+    if not raw:
+        return ""
+
+    if raw.startswith("+"):
+        return raw
+
+    if raw.startswith(DEFAULT_COUNTRY_CALLING_CODE):
+        return f"+{raw}"
+
+    if raw.isdigit() and len(raw) == 9:
+        return f"+{DEFAULT_COUNTRY_CALLING_CODE}{raw}"
+
+    return f"+{raw}"
+
+def get_otp_from_server(pairing_id: str) -> tuple[str, int]:
+    """
+    Llama al endpoint privado del server:
+      GET {API_BASE}/pairing/otp/{pairing_id}
+      Header: X-BOT-SECRET
+    """
+    url = f"{API_BASE}/pairing/otp/{pairing_id}"
+    headers = {"X-BOT-SECRET": BOT_SECRET}
+
+    logger.info("Consultando OTP en servidor: %s", url)
+
+    resp = requests.get(url, headers=headers, timeout=10)
+
+    logger.info("Respuesta servidor OTP: HTTP %s", resp.status_code)
+    logger.debug("Body servidor OTP: %s", safe_preview(resp.text, 1000))
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"OTP error {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    otp = str(data.get("otp", "")).strip()
+    ttl = int(data.get("ttlRemaining", 0))
+    if not otp:
+        raise RuntimeError("OTP vacío en respuesta del servidor")
+    return otp, ttl
 
 # ------------------------------------------------------------
 # HANDLERS
@@ -59,74 +135,135 @@ def safe_preview(text: str, max_len: int = 180) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /start
-    /start PAIR_P_xxx
+    /start PAIR_<pairingId>
+    /start LINK_<pairingId>
     """
-    chat_id = update.effective_chat.id if update.effective_chat else None
+    msg = update.message
+    chat = update.effective_chat
     user = update.effective_user
-    user_id = user.id if user else None
-    username = user.username if user else None
 
     args = context.args or []
-    logger.info("CMD /start | chat_id=%s user_id=%s username=%s args=%s", chat_id, user_id, username, args)
+    logger.info(
+        "CMD /start | chat_id=%s user_id=%s username=%s args=%s",
+        chat.id if chat else None,
+        user.id if user else None,
+        user.username if user else None,
+        args,
+    )
 
     if not args:
-        await update.message.reply_text(HELP_TEXT)
+        await msg.reply_text(HELP_TEXT)
         return
 
-    payload = args[0].strip()
-    pairing_id = extract_pairing_id(payload)
+    mode, pairing_id = parse_start_payload(args[0])
+    logger.info("Payload mode=%s pairing_id=%s", mode, pairing_id)
 
-    logger.info("Payload recibido: %s | pairing_id extraído: %s", payload, pairing_id)
-
-    if not pairing_id:
-        await update.message.reply_text(
-            "⚠️ Payload no reconocido.\n"
-            "Vuelve a abrir el enlace desde la app y pulsa START.\n\n"
-            f"Ejemplo: https://t.me/{BOT_USERNAME}?start=PAIR_<pairingId>"
-        )
+    if not mode or not pairing_id:
+        await msg.reply_text("⚠️ Payload no reconocido. Abre el enlace desde la app.")
+        await msg.reply_text(HELP_TEXT)
         return
 
-    # Consultar OTP al servidor (endpoint privado)
-    url = f"{API_BASE}/pairing/otp/{pairing_id}"
-    headers = {"X-BOT-SECRET": BOT_SECRET}
-
-    logger.info("Consultando OTP en servidor: %s", url)
-
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-
-        logger.info("Respuesta servidor OTP: HTTP %s", resp.status_code)
-        logger.debug("Body servidor OTP: %s", safe_preview(resp.text, 600))
-
-        if resp.status_code != 200:
-            await update.message.reply_text(
-                "❌ No puedo obtener el OTP del servidor.\n"
-                f"HTTP {resp.status_code}\n{resp.text}"
+    if mode == "PAIR":
+        # Envía OTP directamente
+        try:
+            otp, ttl = get_otp_from_server(pairing_id)
+            logger.info("OTP obtenido OK | pairing_id=%s otp=%s ttl=%s", pairing_id, otp, ttl)
+            await msg.reply_text(
+                f"✅ Tu OTP es: {otp}\n"
+                f"⏳ Caduca en {ttl} segundos.\n\n"
+                "Vuelve a la app Videovigilancia Mobile, escribe el OTP y confirma."
             )
-            return
+        except Exception as e:
+            logger.exception("Error en PAIR: %s", e)
+            await msg.reply_text(f"❌ No puedo obtener el OTP.\n{e}")
+        return
 
-        data = resp.json()
-        otp = data.get("otp")
-        ttl = data.get("ttlRemaining")
+    if mode == "LINK":
+        # Guardamos pairingId pendiente para enviar OTP tras vincular contacto
+        context.user_data["pending_pairing_id"] = pairing_id
 
-        logger.info("OTP obtenido OK | pairing_id=%s otp=%s ttlRemaining=%s", pairing_id, otp, ttl)
+        # Botón “Compartir contacto” (Telegram enviará el teléfono al bot) 
+        button = KeyboardButton(text="📱 Compartir mi contacto", request_contact=True)
+        keyboard = ReplyKeyboardMarkup([[button]], resize_keyboard=True, one_time_keyboard=True)
 
-        await update.message.reply_text(
-            f"✅ Tu OTP es: {otp}\n"
-            f"⏳ Caduca en {ttl} segundos.\n\n"
-            "Vuelve a la app Videovigilancia Mobile, escribe el OTP y confirma."
+        await msg.reply_text(
+            "Para vincular tu número, pulsa el botón y comparte tu contacto.\n"
+            "Después te enviaré el OTP automáticamente.",
+            reply_markup=keyboard,
         )
+        return
 
-    except requests.Timeout:
-        logger.exception("Timeout consultando OTP (requests.Timeout)")
-        await update.message.reply_text("❌ Timeout consultando el servidor. Inténtalo de nuevo.")
-    except Exception as e:
-        logger.exception("Error consultando OTP: %s", e)
-        await update.message.reply_text(f"❌ Error consultando el servidor: {e}")
+async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Recibe el contacto compartido por el usuario.
+    Guarda phone->chat_id en SQLite y envía OTP si había pending_pairing_id.
+    """
+    msg = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not msg or not msg.contact:
+        return
+
+    contact = msg.contact
+    logger.info(
+        "CONTACT | chat_id=%s user_id=%s contact_user_id=%s phone=%s",
+        chat.id if chat else None,
+        user.id if user else None,
+        contact.user_id,
+        contact.phone_number,
+    )
+
+    # Seguridad: solo aceptar el contacto del propio usuario (evita vincular el teléfono de otro)
+    if contact.user_id and user and contact.user_id != user.id:
+        await msg.reply_text(
+            "❌ Por seguridad, solo acepto tu propio contacto (no el de otra persona).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    phone_e164 = normalize_phone_e164(contact.phone_number or "")
+    if not phone_e164:
+        await msg.reply_text(
+            "❌ No he podido leer tu número. Inténtalo de nuevo.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # Guardar vínculo en SQLite
+    upsert_link(
+        phone_e164=phone_e164,
+        chat_id=chat.id,
+        telegram_user_id=user.id if user else 0,
+        username=user.username if user else None,
+    )
+
+    logger.info("DB UPSERT OK | phone=%s chat_id=%s user_id=%s", phone_e164, chat.id, user.id if user else None)
+    
+    await msg.reply_text(
+        f"✅ Vinculación guardada.\n"
+        f"Teléfono: {phone_e164}\n"
+        f"chat_id: {chat.id}\n\n"
+        "A partir de ahora el servidor podrá enviarte OTP por Telegram usando tu número.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+    # Si venía con LINK_<pairingId>, enviamos OTP automáticamente
+    pending_pairing_id = context.user_data.pop("pending_pairing_id", None)
+    if pending_pairing_id:
+        try:
+            otp, ttl = get_otp_from_server(pending_pairing_id)
+            await msg.reply_text(
+                f"✅ Tu OTP es: {otp}\n"
+                f"⏳ Caduca en {ttl} segundos.\n\n"
+                "Vuelve a la app Videovigilancia Mobile y confirma."
+            )
+        except Exception as e:
+            logger.exception("Error enviando OTP tras LINK: %s", e)
+            await msg.reply_text(f"❌ No puedo obtener el OTP.\n{e}")
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Comando simple para comprobar que el bot está vivo."""
-    logger.info("CMD /ping recibido")
+    logger.info("CMD /ping")
     await update.message.reply_text("pong ✅")
 
 # ------------------------------------------------------------
@@ -146,7 +283,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
 
-    # Polling loop
+    # Handler contacto (vinculación) 
+    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
+
     logger.info("🤖 Bot listo. Ctrl+C para parar.")
     app.run_polling()
 
