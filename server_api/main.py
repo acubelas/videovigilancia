@@ -266,66 +266,154 @@ def pairing_get_otp(pairing_id: str, x_bot_secret: str | None = Header(default=N
     remaining = int(PAIRING_TTL - age)
     return {"pairingId": pairing_id, "otp": sess.code, "ttlRemaining": remaining}
 
-
 # ------------------------------------------------------------
-# Events endpoints (Sprint 2.2: protected)
+# Events endpoints (Sprint 2.3: protected + snapshots robustos)
 # ------------------------------------------------------------
-@app.get("/events")
-def get_events(limit: int = 50, _token: str = Depends(require_auth)):
-    limit = max(1, min(limit, 200))
-    return {"items": list_events(limit=limit)}
-
-
 import base64
 from pathlib import Path
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
 
-SNAP_DIR = Path("data/snapshots")
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", "2000000"))  # 2MB por defecto
+
+SNAP_DIR = Path(os.getenv("SNAP_DIR", "data/snapshots"))
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _normalize_b64(raw: str) -> str:
+    """Acepta base64 puro o data URL 'data:image/jpeg;base64,...'."""
+    s = (raw or "").strip().replace("\n", "").replace("\r", "")
+    if s.startswith("data:"):
+        # data:image/jpeg;base64,AAAA
+        if "," not in s:
+            raise HTTPException(status_code=400, detail="Invalid data URL base64")
+        s = s.split(",", 1)[1]
+    return s
+
+
+def _detect_ext(image_bytes: bytes) -> str:
+    """Detecta PNG/JPEG por magic bytes."""
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if image_bytes.startswith(b"\xff\xd8"):
+        return "jpg"
+    # si no se reconoce, guardamos como jpg por defecto
+    return "jpg"
+
+
+def _safe_resolve_under(base: Path, target: Path) -> Path:
+    """Garantiza que target está dentro de base (anti path traversal)."""
+    base_r = base.resolve()
+    target_r = target.resolve()
+    if base_r not in target_r.parents and base_r != target_r:
+        raise HTTPException(status_code=400, detail="Invalid snapshot path")
+    return target_r
+
+
+class EventIn(BaseModel):
+    ts: str | None = None
+    type: str = "snapshot"
+    cameraId: str | None = None
+    confidence: float | None = None
+    message: str | None = None
+
+    # compatibilidad: si en cliente usas snapshotBase64 o imageBase64, aceptamos ambos
+    snapshotBase64: str | None = None
+    imageBase64: str | None = None
+
+
+@app.get("/events")
+def get_events(
+    limit: int = 50,
+    before: str | None = None,
+    _token: str = Depends(require_auth)
+):
+    limit = max(1, min(limit, 200))
+
+    # Si tu db.list_events aún no soporta before, puedes ignorarlo,
+    # pero te recomiendo añadirlo (te digo cómo debajo).
+    try:
+        items = list_events(limit=limit, before=before)  # si lo implementas en db.py
+    except TypeError:
+        items = list_events(limit=limit)
+
+    # Añadimos URL de snapshot para la app
+    for it in items:
+        it["snapshotUrl"] = f"/events/{it['id']}/snapshot.jpg"
+
+    return {"items": items}
+
 
 @app.post("/events")
 def post_event(ev: EventIn, _token: str = Depends(require_auth)):
-    snapshot_path = ev.snapshotPath
+    # ts por defecto = ahora UTC
+    ts = ev.ts or datetime.now(timezone.utc).isoformat()
 
-    # Si viene snapshot en base64, lo guardamos como JPG
-    if ev.snapshotBase64:
-        # 1) Creamos el evento primero para tener un ID estable
-        temp_id = "evt_" + secrets.token_urlsafe(8)
-        jpg_path = SNAP_DIR / f"{temp_id}.jpg"
+    # elegimos base64 de cualquiera de los campos
+    b64_payload = ev.snapshotBase64 or ev.imageBase64
 
-        raw = ev.snapshotBase64.strip()
-        # Permite formato "data:image/jpeg;base64,...."
-        if "," in raw:
-            raw = raw.split(",", 1)[1]
+    snapshot_path: str | None = None
+    event_id: str | None = None
 
+    if b64_payload:
+        raw = _normalize_b64(b64_payload)
+
+        # decode estricto + límite
         try:
-            jpg_bytes = base64.b64decode(raw, validate=False)
-            jpg_path.write_bytes(jpg_bytes)
-            snapshot_path = str(jpg_path)
+            img_bytes = base64.b64decode(raw, validate=True)
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid snapshotBase64: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
 
-        # Insert event con ese ID (para que snapshot y event coincidan)
-        event_id = insert_event(
-            ts=ev.ts,
+        if not img_bytes:
+            raise HTTPException(status_code=400, detail="Empty image")
+
+        if len(img_bytes) > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Image too large (max {MAX_IMAGE_BYTES} bytes)"
+            )
+
+        # Creamos ID estable para que snapshot y event coincidan
+        event_id = "evt_" + secrets.token_urlsafe(8)
+
+        ext = _detect_ext(img_bytes)
+        file_path = SNAP_DIR / f"{event_id}.{ext}"
+        file_path = _safe_resolve_under(SNAP_DIR, file_path)
+
+        # Guardamos a disco (si falla, no insertamos evento)
+        try:
+            file_path.write_bytes(img_bytes)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Saving image failed: {e}")
+
+        snapshot_path = str(file_path)
+
+    # Insert event (con event_id si lo hemos creado arriba)
+    try:
+        new_id = insert_event(
+            ts=ts,
             type_=ev.type,
             camera_id=ev.cameraId,
             confidence=ev.confidence,
             message=ev.message,
             snapshot_path=snapshot_path,
-            event_id=temp_id,
+            event_id=event_id,
         )
-        return {"ok": True, "id": event_id}
+    except Exception as e:
+        # Si insert falla y ya guardamos fichero, limpiamos
+        if snapshot_path:
+            try:
+                Path(snapshot_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
-    # Sin snapshot base64 → comportamiento normal
-    event_id = insert_event(
-        ts=ev.ts,
-        type_=ev.type,
-        camera_id=ev.cameraId,
-        confidence=ev.confidence,
-        message=ev.message,
-        snapshot_path=snapshot_path,
-    )
-    return {"ok": True, "id": event_id}
+    return {
+        "ok": True,
+        "id": new_id,
+        "ts": ts,
+        "snapshotUrl": f"/events/{new_id}/snapshot.jpg" if snapshot_path else None,
+    }
 
 
 @app.get("/events/{event_id}/snapshot.jpg")
@@ -334,13 +422,17 @@ def get_event_snapshot(event_id: str, _token: str = Depends(require_auth)):
     if not path:
         raise HTTPException(status_code=404, detail="Snapshot not found")
 
-    # Seguridad básica: normaliza path y exige que exista
-    if not os.path.isabs(path):
-        # permitimos rutas relativas respecto al repo
-        path = os.path.join(os.getcwd(), path)
+    p = Path(path)
+    # Si es relativo, lo hacemos relativo a cwd
+    if not p.is_absolute():
+        p = Path(os.getcwd()) / p
 
-    if not os.path.exists(path):
+    # Blindaje: solo servir ficheros dentro de SNAP_DIR
+    p = _safe_resolve_under(SNAP_DIR, p)
+
+    if not p.exists():
         raise HTTPException(status_code=404, detail="Snapshot file missing")
 
-    # FileResponse sirve el JPG con el content-type correcto
-    return FileResponse(path, media_type="image/jpeg")
+    ext = p.suffix.lower()
+    media_type = "image/png" if ext == ".png" else "image/jpeg"
+    return FileResponse(str(p), media_type=media_type)

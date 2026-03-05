@@ -120,28 +120,34 @@ def insert_event(
         con.commit()
     return event_id
 
-def list_events(limit: int = 50) -> list[dict]:
+def list_events(limit: int = 50, before: str | None = None) -> list[dict]:
     with _conn() as con:
-        cur = con.execute("""
-        SELECT id, ts, type, camera_id, confidence, message, snapshot_path
-        FROM events
-        ORDER BY ts DESC
-        LIMIT ?
-        """, (limit,))
+        if before:
+            cur = con.execute("""
+            SELECT id, ts, type, camera_id, confidence, message, snapshot_path
+            FROM events
+            WHERE ts < ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """, (before, limit))
+        else:
+            cur = con.execute("""
+            SELECT id, ts, type, camera_id, confidence, message, snapshot_path
+            FROM events
+            ORDER BY ts DESC
+            LIMIT ?
+            """, (limit,))
         rows = cur.fetchall()
 
-    out = []
-    for r in rows:
-        out.append({
-            "id": r[0],
-            "ts": r[1],
-            "type": r[2],
-            "cameraId": r[3],
-            "confidence": r[4],
-            "message": r[5],
-            "snapshotPath": r[6],
-        })
-    return out       
+    return [{
+        "id": r[0],
+        "ts": r[1],
+        "type": r[2],
+        "cameraId": r[3],
+        "confidence": r[4],
+        "message": r[5],
+        "snapshotPath": r[6],
+    } for r in rows]    
 
 def get_event_snapshot_path(event_id: str) -> str | None:
     with _conn() as con:
