@@ -36,6 +36,16 @@ def init_db():
             """)
         con.commit()
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                revoked_at TEXT
+            )
+            """)
+        con.commit()
+
 def upsert_link(phone_e164: str, chat_id: int, telegram_user_id: int, username: str | None):
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as con:
@@ -49,6 +59,34 @@ def upsert_link(phone_e164: str, chat_id: int, telegram_user_id: int, username: 
             linked_at=excluded.linked_at
         """, (phone_e164, chat_id, telegram_user_id, username, now))
         con.commit()
+
+def upsert_session(token: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute("""
+        INSERT INTO sessions(token, created_at, last_seen_at, revoked_at)
+        VALUES (?, ?, ?, NULL)
+        ON CONFLICT(token) DO UPDATE SET
+            last_seen_at=excluded.last_seen_at
+        """, (token, now, now))
+        con.commit()
+
+def session_is_valid(token: str) -> bool:
+    with _conn() as con:
+        cur = con.execute("""
+        SELECT revoked_at FROM sessions WHERE token=?
+        """, (token,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        revoked_at = row[0]
+        return revoked_at is None
+
+def revoke_session(token: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as con:
+        con.execute("UPDATE sessions SET revoked_at=? WHERE token=?", (now, token))
+        con.commit()        
 
 def get_chat_id_by_phone(phone_e164: str) -> int | None:
     with _conn() as con:
@@ -104,3 +142,12 @@ def list_events(limit: int = 50) -> list[dict]:
             "snapshotPath": r[6],
         })
     return out       
+
+def get_event_snapshot_path(event_id: str) -> str | None:
+    with _conn() as con:
+        cur = con.execute("SELECT snapshot_path FROM events WHERE id=?", (event_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return row[0]
+        

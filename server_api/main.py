@@ -1,30 +1,45 @@
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
-import secrets
-import time
+from __future__ import annotations
+
 import os
+import time
+import secrets
 from dataclasses import dataclass
+
 from dotenv import load_dotenv
-load_dotenv(".env")
-import requests
-from server_api.db import init_db, get_chat_id_by_phone
+from fastapi import FastAPI, HTTPException, Header, Depends
+from pydantic import BaseModel
+
+from fastapi.responses import FileResponse
+import os
+
+from server_api.db import (
+    init_db, get_chat_id_by_phone, list_events, insert_event,
+    upsert_session, session_is_valid, get_event_snapshot_path
+)
+
+
 from server_api.telegram_utils import telegram_send_message
 
-from server_api.db import init_db, list_events, insert_event
+# ------------------------------------------------------------
+# ENV
+# ------------------------------------------------------------
+load_dotenv(".env")
 
-app = FastAPI(title="Videovigilancia")
-#inicializa SQLite
-init_db()
-
-# --- Config desde entorno (.env) ---
-PAIRING_TTL = int(os.getenv("PAIRING_TTL_SECONDS", "600"))  # 10 min
+PAIRING_TTL = int(os.getenv("PAIRING_TTL_SECONDS", "600"))
 MAX_ATTEMPTS = int(os.getenv("PAIRING_MAX_ATTEMPTS", "5"))
 
 BOT_SHARED_SECRET = os.getenv("BOT_SHARED_SECRET", "")
 TAILSCALE_SERVER_URL = os.getenv("TAILSCALE_SERVER_URL", "http://100.88.172.7:8080")
 TELEGRAM_BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "acubelasbot")
 
-# --- Modelo de sesión de emparejamiento ---
+app = FastAPI(title="Videovigilancia")
+
+# Inicializa SQLite (telegram_links, events, sessions, etc.)
+init_db()
+
+# ------------------------------------------------------------
+# Pairing sessions (memoria)
+# ------------------------------------------------------------
 @dataclass
 class PairingSession:
     pairing_id: str
@@ -33,14 +48,18 @@ class PairingSession:
     used: bool = False
     attempts: int = 0
 
-# En memoria (por ahora). Si reinicias uvicorn, se pierde.
+
+# OJO: si reinicias uvicorn se pierde el dict (normal en Sprint actual)
 pairings: dict[str, PairingSession] = {}
 
-# --- Modelos API ---
+# ------------------------------------------------------------
+# Models
+# ------------------------------------------------------------
 class PairingRequestIn(BaseModel):
     method: str = "qr"            # "qr" | "telegram" | "telegram_phone"
     serverUrl: str | None = None
-    phone: str | None = None      # usado en telegram_phone
+    phone: str | None = None      # usado en telegram_phone (E.164)
+
 
 class PairingRequestOut(BaseModel):
     pairingId: str
@@ -49,14 +68,18 @@ class PairingRequestOut(BaseModel):
     qrPayload: dict | None = None
     telegramStartUrl: str | None = None
 
+
 class PairingConfirmIn(BaseModel):
     pairingId: str
     code: str
     deviceId: str | None = None
     deviceName: str | None = None
 
+
 class PairingConfirmOut(BaseModel):
     accessToken: str
+
+
 
 class EventIn(BaseModel):
     ts: str
@@ -65,37 +88,62 @@ class EventIn(BaseModel):
     confidence: float | None = None
     message: str | None = None
     snapshotPath: str | None = None
+    snapshotBase64: str | None = None  # 👈 para test
+# ------------------------------------------------------------
+# Auth (Sprint 2.2)
+# ------------------------------------------------------------
+def require_auth(authorization: str | None = Header(default=None)) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-class EventOut(BaseModel):
-    id: str
-    ts: str
-    type: str
-    cameraId: str | None = None
-    confidence: float | None = None
-    message: str | None = None
-    snapshotPath: str | None = None
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid Authorization format (expected Bearer token)")
+
+    token = parts[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    if not session_is_valid(token):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    # ✅ NUEVO: actualizar last_seen_at en cada request autenticada
+    upsert_session(token)
+
+    return token
 
 
-# --- Endpoints ---
+# ------------------------------------------------------------
+# Basic endpoints
+# ------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True, "app": "Videovigilancia"}
+
 
 @app.get("/")
 def index():
     return {
         "ok": True,
         "message": "Videovigilancia API",
-        "endpoints": ["/health", "/pairing/request", "/pairing/confirm", "/pairing/otp/{pairingId}"],
+        "endpoints": [
+            "/health",
+            "/pairing/request",
+            "/pairing/confirm",
+            "/pairing/otp/{pairingId}",
+            "/events",
+        ],
     }
 
+
+# ------------------------------------------------------------
+# Pairing endpoints
+# ------------------------------------------------------------
 @app.post("/pairing/request", response_model=PairingRequestOut)
 def pairing_request(req: PairingRequestIn):
     method = (req.method or "qr").strip().lower()
 
-    # ✅ DEFINIR ttl SIEMPRE ANTES DE USARLO
     ttl = PAIRING_TTL
-
     pairing_id = "P_" + secrets.token_urlsafe(6)
     otp = f"{secrets.randbelow(1_000_000):06d}"
 
@@ -109,7 +157,7 @@ def pairing_request(req: PairingRequestIn):
 
     public_url = (req.serverUrl or TAILSCALE_SERVER_URL).strip()
 
-    # --- TELEGRAM (bot + start) ---
+    # ---- Telegram: bot + Start (Sprint 1.2) ----
     if method == "telegram":
         start_payload = f"PAIR_{pairing_id}"
         start_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={start_payload}"
@@ -119,7 +167,7 @@ def pairing_request(req: PairingRequestIn):
             "telegramStartUrl": start_url,
         }
 
-    # --- TELEGRAM POR NÚMERO (Sprint 1.3) ---
+    # ---- Telegram por número (Sprint 1.3) ----
     if method == "telegram_phone":
         phone = (req.phone or "").strip().replace(" ", "")
         if not phone:
@@ -129,7 +177,7 @@ def pairing_request(req: PairingRequestIn):
 
         chat_id = get_chat_id_by_phone(phone)
 
-        # No vinculado -> devolvemos link LINK_<pairingId>
+        # No vinculado: devolver link LINK_<pairingId>
         if chat_id is None:
             start_payload = f"LINK_{pairing_id}"
             start_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={start_payload}"
@@ -139,7 +187,7 @@ def pairing_request(req: PairingRequestIn):
                 "telegramStartUrl": start_url,
             }
 
-        # Vinculado -> enviamos OTP directo por Telegram (Bot API sendMessage) 
+        # Vinculado: enviar OTP directo al chat_id
         telegram_send_message(
             chat_id,
             f"✅ Tu OTP es: {otp}\n"
@@ -152,7 +200,7 @@ def pairing_request(req: PairingRequestIn):
             "telegramStartUrl": None,
         }
 
-    # --- QR (por defecto) ---
+    # ---- QR (por defecto) ----
     qr_payload = {"serverUrl": public_url, "pairingId": pairing_id}
     return {
         "pairingId": pairing_id,
@@ -160,6 +208,7 @@ def pairing_request(req: PairingRequestIn):
         "otp": otp,
         "qrPayload": qr_payload,
     }
+
 
 @app.post("/pairing/confirm", response_model=PairingConfirmOut)
 def pairing_confirm(req: PairingConfirmIn):
@@ -184,10 +233,17 @@ def pairing_confirm(req: PairingConfirmIn):
         raise HTTPException(status_code=400, detail="Invalid code")
 
     sess.used = True
+
+    # Crear token + persistir sesión en SQLite (Sprint 2.2)
     token = secrets.token_urlsafe(24)
+    upsert_session(token)
+
     return {"accessToken": token}
 
-# Endpoint PRIVADO para el bot: obtener OTP de un pairingId
+
+# ------------------------------------------------------------
+# Private endpoint for Telegram bot to fetch OTP
+# ------------------------------------------------------------
 @app.get("/pairing/otp/{pairing_id}")
 def pairing_get_otp(pairing_id: str, x_bot_secret: str | None = Header(default=None)):
     if not BOT_SHARED_SECRET:
@@ -210,20 +266,81 @@ def pairing_get_otp(pairing_id: str, x_bot_secret: str | None = Header(default=N
     remaining = int(PAIRING_TTL - age)
     return {"pairingId": pairing_id, "otp": sess.code, "ttlRemaining": remaining}
 
+
+# ------------------------------------------------------------
+# Events endpoints (Sprint 2.2: protected)
+# ------------------------------------------------------------
 @app.get("/events")
-def get_events(limit: int = 50):
+def get_events(limit: int = 50, _token: str = Depends(require_auth)):
     limit = max(1, min(limit, 200))
     return {"items": list_events(limit=limit)}
 
+
+import base64
+from pathlib import Path
+
+SNAP_DIR = Path("data/snapshots")
+SNAP_DIR.mkdir(parents=True, exist_ok=True)
+
 @app.post("/events")
-def post_event(ev: EventIn):
-    # Para pruebas (luego lo blindamos con auth)
+def post_event(ev: EventIn, _token: str = Depends(require_auth)):
+    snapshot_path = ev.snapshotPath
+
+    # Si viene snapshot en base64, lo guardamos como JPG
+    if ev.snapshotBase64:
+        # 1) Creamos el evento primero para tener un ID estable
+        temp_id = "evt_" + secrets.token_urlsafe(8)
+        jpg_path = SNAP_DIR / f"{temp_id}.jpg"
+
+        raw = ev.snapshotBase64.strip()
+        # Permite formato "data:image/jpeg;base64,...."
+        if "," in raw:
+            raw = raw.split(",", 1)[1]
+
+        try:
+            jpg_bytes = base64.b64decode(raw, validate=False)
+            jpg_path.write_bytes(jpg_bytes)
+            snapshot_path = str(jpg_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid snapshotBase64: {e}")
+
+        # Insert event con ese ID (para que snapshot y event coincidan)
+        event_id = insert_event(
+            ts=ev.ts,
+            type_=ev.type,
+            camera_id=ev.cameraId,
+            confidence=ev.confidence,
+            message=ev.message,
+            snapshot_path=snapshot_path,
+            event_id=temp_id,
+        )
+        return {"ok": True, "id": event_id}
+
+    # Sin snapshot base64 → comportamiento normal
     event_id = insert_event(
         ts=ev.ts,
         type_=ev.type,
         camera_id=ev.cameraId,
         confidence=ev.confidence,
         message=ev.message,
-        snapshot_path=ev.snapshotPath,
+        snapshot_path=snapshot_path,
     )
     return {"ok": True, "id": event_id}
+
+
+@app.get("/events/{event_id}/snapshot.jpg")
+def get_event_snapshot(event_id: str, _token: str = Depends(require_auth)):
+    path = get_event_snapshot_path(event_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    # Seguridad básica: normaliza path y exige que exista
+    if not os.path.isabs(path):
+        # permitimos rutas relativas respecto al repo
+        path = os.path.join(os.getcwd(), path)
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Snapshot file missing")
+
+    # FileResponse sirve el JPG con el content-type correcto
+    return FileResponse(path, media_type="image/jpeg")
