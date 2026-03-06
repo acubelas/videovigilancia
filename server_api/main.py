@@ -12,13 +12,17 @@ from pydantic import BaseModel
 from fastapi.responses import FileResponse
 import os
 
+
 from server_api.db import (
     init_db, get_chat_id_by_phone, list_events, insert_event,
-    upsert_session, session_is_valid, get_event_snapshot_path
-)
-
+    upsert_session, session_is_valid, get_event_snapshot_path,
+    delete_event,  # 👈 AÑADIR
+    )
 
 from server_api.telegram_utils import telegram_send_message
+from pathlib import Path
+
+from server_api.db import delete_event  # añade este import
 
 # ------------------------------------------------------------
 # ENV
@@ -436,3 +440,37 @@ def get_event_snapshot(event_id: str, _token: str = Depends(require_auth)):
     ext = p.suffix.lower()
     media_type = "image/png" if ext == ".png" else "image/jpeg"
     return FileResponse(str(p), media_type=media_type)
+
+
+@app.delete("/events/{event_id}")
+def delete_event_api(event_id: str, _token: str = Depends(require_auth)):
+    """
+    Borra un evento y su snapshot asociado (si existe).
+    """
+
+    # 1) Localiza el snapshot (si existe en DB)
+    path = get_event_snapshot_path(event_id)
+
+    # 2) Borra el fichero de snapshot (si existe) con blindaje: solo dentro de SNAP_DIR
+    if path:
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(os.getcwd()) / p
+
+        try:
+            snap_dir = SNAP_DIR.resolve()
+            pr = p.resolve()
+
+            # ✅ solo borramos si está dentro de la carpeta de snapshots
+            if snap_dir in pr.parents and pr.exists():
+                pr.unlink()
+        except Exception:
+            # No abortamos por fallo de IO
+            pass
+
+    # 3) Borra el evento de la BD
+    ok = delete_event(event_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return {"ok": True, "id": event_id}

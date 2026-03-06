@@ -156,4 +156,10 @@ def get_event_snapshot_path(event_id: str) -> str | None:
         if not row:
             return None
         return row[0]
+    
+def delete_event(event_id: str) -> bool:
+    with _conn() as con:
+        cur = con.execute("DELETE FROM events WHERE id=?", (event_id,))
+        con.commit()
+        return cur.rowcount > 0        
         
